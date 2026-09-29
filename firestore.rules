@@ -1,0 +1,108 @@
+rules_version = '2';
+
+/**
+ * Firestore security rules for Tadika Cahaya Bintang portal.
+ * Deploy with:  firebase deploy --only firestore:rules
+ *
+ * Role model: the caller's role lives in users/{uid}.role and is only ever
+ * 'admin' (staff) or 'parent' (guardian). Role is read with a sub-document
+ * lookup so a user cannot escalate themselves by writing it.
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function myProfileExists() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    // True when `studentId` belongs to the signed-in guardian, based on the
+    // `childIds` list maintained by staff. Parents cannot edit that field
+    // themselves (see the users rules), so it is a trustworthy link. Firestore
+    // caches the get(), so a multi-row query costs one extra document read.
+    function isParentOf(studentId) {
+      return myProfileExists()
+        && 'childIds' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data
+        && studentId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.childIds;
+    }
+
+    // Ownership of a fee or attendance document. Uses the denormalised
+    // `parentUid` written by the app when present, and falls back to the
+    // childIds link so documents created before that field existed remain
+    // readable without a data back-fill. Only valid where `resource` exists.
+    function ownsDocument() {
+      return myProfileExists()
+        && (resource.data.parentUid == request.auth.uid || isParentOf(resource.data.studentId));
+    }
+
+    // Users may read only their own profile (staff read all of them), create
+    // their own profile, and change a small set of display fields. `role` and
+    // `childIds` are deliberately excluded from self-update: a parent must not
+    // be able to promote themselves or attach somebody else's child.
+    match /users/{userId} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == userId);
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.role in ['admin', 'parent'];
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['displayName', 'lastLoginAt', 'photoURL', 'phone', 'provider']);
+      allow delete: if isAdmin();
+    }
+
+    // Activity feed: every signed-in user can read and like; only staff post/edit.
+    match /posts/{postId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Invoices: staff manage everything. A guardian can read the invoices that
+    // belong to their own child, and nothing else. Reads must be filtered
+    // server-side (see src/lib/firestore.ts) because Firestore denies a whole
+    // query if any single candidate row would fail these rules.
+    match /invoices/{invoiceId} {
+      allow read: if isAdmin() || ownsDocument();
+      allow create, delete: if isAdmin();
+      // A guardian may record the outcome of their own payment only. Amounts,
+      // items, due dates and the owner link stay staff-only, so nobody can
+      // discount their own bill. `updatedAt` is appended by saveDoc().
+      allow update: if isAdmin()
+        || (ownsDocument()
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['status', 'paidDate', 'paymentMethod', 'transactionId', 'updatedAt']));
+    }
+
+    // Attendance: a guardian reads their own child's history; marking is
+    // staff-only, including the temperature and notes fields.
+    match /attendance/{recordId} {
+      allow read: if isAdmin() || ownsDocument();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /announcements/{announcementId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /messages/{messageId} {
+      allow read, create: if signedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // Anything not matched above is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

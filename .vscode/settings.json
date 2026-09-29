@@ -1,0 +1,7 @@
+{
+  // The official Tailwind CSS VS Code extension understands @tailwind/@apply.
+  // If you don't use it, this keeps the built-in CSS linter quiet.
+  "css.lint.unknownAtRules": "ignore",
+  "files.eol": "\n",
+  "editor.formatOnSave": true
+}
